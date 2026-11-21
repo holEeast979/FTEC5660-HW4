@@ -21,10 +21,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
 from langchain_deepseek import ChatDeepSeek
+from rank_bm25 import BM25Okapi
 
 load_dotenv()
 
@@ -32,6 +34,247 @@ load_dotenv()
 # =============================================================================
 # Your code: add imports, constants and helper functions here.
 # =============================================================================
+
+_COMPANY_REGISTRY: dict[str, str] = {}
+
+_TOKEN_RE = re.compile(r"[a-z]+|\d+(?:[.,]\d+)*", re.IGNORECASE)
+_QUERY_STOP_WORDS = {
+    "a", "about", "after", "all", "an", "and", "annual", "any", "are", "as",
+    "at", "be", "because", "before", "between", "by", "call", "can", "did",
+    "do", "does", "during", "end", "ended", "for", "fourth", "from", "full",
+    "had", "has", "have", "held", "how", "in", "into", "is", "it", "its",
+    "more", "much", "of", "on", "or", "our", "report", "results", "review",
+    "set", "than", "that", "the", "their", "this", "to", "up", "was", "were",
+    "what", "when", "where", "which", "who", "why", "will", "with", "year",
+    "q", "fy", "usd", "million", "billion", "percent", "per", "share",
+    "earning", "earnings", "management", "give", "gives", "gave", "month",
+    "months",
+    "december", "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november",
+    "generate", "generated", "earn", "earned", "announce", "announced",
+    "large", "firm", "rate", "rates", "number", "value",
+}
+_NON_ENTITY_FIRST_WORDS = {
+    "a", "an", "annual", "accounts", "asset", "assets", "at", "cash", "chief",
+    "consolidated", "december", "director", "directors", "during", "employee",
+    "employees", "executive", "expenses", "financial", "fourth", "full",
+    "gross", "how", "income", "in", "independent", "investment", "liabilities",
+    "management", "africa", "america", "americas", "asia", "europe", "middle",
+    "north", "pacific", "south",
+    "net", "on", "operating", "other", "q", "revenue", "risk", "statement",
+    "total", "usd", "what", "which", "who", "year",
+}
+_BROKER_ACTIONS = (
+    r"(?:give|gives|gave|set|sets|assign|assigns|forecast|forecasts|estimate|"
+    r"estimates|rate|rates|recommend|recommends|reiterate|reiterates)"
+)
+_TOKEN_ALIASES = {
+    "audit": {"audit", "auditor"},
+    "auditor": {"audit", "auditor"},
+    "borrow": {"borrow", "debt"},
+    "cash": {"cash", "equivalent"},
+    "ceo": {"ceo", "chief", "executive", "officer"},
+    "cfo": {"cfo", "chief", "financial", "officer"},
+    "city": {"city", "headquarter"},
+    "employee": {"employee", "staff", "headcount"},
+    "equivalent": {"cash", "equivalent"},
+    "forecast": {"estimate", "forecast", "projection"},
+    "guide": {"guide", "guidance", "outlook"},
+    "headquarter": {"city", "headquarter"},
+    "headcount": {"employee", "headcount", "staff"},
+    "income": {"income", "profit"},
+    "profit": {"income", "profit"},
+    "programme": {"program", "programme"},
+    "program": {"program", "programme"},
+    "rating": {"rating", "recommendation"},
+    "receivable": {"account", "receivable"},
+    "account": {"account", "receivable"},
+    "repurchase": {"buyback", "repurchase"},
+    "revenue": {"revenue", "sales"},
+    "sales": {"revenue", "sales"},
+    "staff": {"employee", "headcount", "staff"},
+}
+
+
+def _plain_text(node: Any) -> str:
+    if node is None:
+        return ""
+    return re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+
+
+def _tokens(text: Any) -> list[str]:
+    """Lower-case word and number tokens with light English suffix normalization."""
+    result = []
+    for raw in _TOKEN_RE.findall(str(text or "").casefold()):
+        token = raw.replace(",", "")
+        if token.isdigit():
+            result.append(token)
+            continue
+        if token in {"guidance", "guided"}:
+            token = "guide"
+        elif token in {"audited", "auditing"}:
+            token = "audit"
+        elif token == "headquartered":
+            token = "headquarter"
+        elif token.endswith("ies") and len(token) > 5:
+            token = token[:-3] + "y"
+        elif token.endswith("ing") and len(token) > 6:
+            token = token[:-3]
+        elif token.endswith("ed") and len(token) > 5:
+            token = token[:-2]
+        elif token.endswith("s") and len(token) > 4 and not token.endswith(("ss", "us", "is")):
+            token = token[:-1]
+        result.append(token)
+    return result
+
+
+def _aliases(token: str) -> set[str]:
+    return set(_TOKEN_ALIASES.get(token, {token}))
+
+
+def _document_metadata(html: str) -> tuple[str, int, str, BeautifulSoup]:
+    soup = BeautifulSoup(html, "lxml")
+    title = _plain_text(soup.title)
+    headings = [_plain_text(tag) for tag in soup.find_all(["h1", "h2", "h3"])]
+    h1 = _plain_text(soup.find("h1"))
+    headline = " ".join([title, *headings[:5]])
+    headline_lower = headline.casefold()
+
+    if re.search(r"earnings?\s+(?:conference\s+)?call|conference\s+call", headline_lower):
+        doc_type = "earnings_call"
+    elif re.search(r"equity\s+research|results\s+review|research\s+report", headline_lower):
+        doc_type = "research_report"
+    else:
+        doc_type = "annual_report"
+
+    year_match = re.search(
+        r"\b(?:fy\s*[-:]?\s*|annual report\s+|full year\s+)(20\d{2})\b",
+        headline,
+        re.IGNORECASE,
+    )
+    if not year_match:
+        year_match = re.search(r"\b(20\d{2})\b", headline)
+    fiscal_year = int(year_match.group(1)) if year_match else 0
+
+    company = re.sub(r"\s*\([^)]*\)\s*$", "", h1).strip()
+    if not company:
+        parts = [part.strip() for part in title.split("|") if part.strip()]
+        if doc_type == "research_report" and len(parts) > 1:
+            company = re.sub(r"\s*\([^)]*\)\s*$", "", parts[1]).strip()
+        elif parts:
+            company = re.split(
+                r"\b(?:annual report|earnings call transcript)\b",
+                parts[0],
+                flags=re.IGNORECASE,
+            )[0].strip()
+    if not company:
+        prefix = re.split(
+            r"\b(?:annual report|earnings|fy\d{4})\b",
+            _plain_text(soup.body),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        company = prefix.strip(" |—-")
+
+    return company, fiscal_year, doc_type, soup
+
+
+def _chunk_windows(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= MAX_CHUNK_CHARS:
+        return [text]
+    overlap = min(360, MAX_CHUNK_CHARS // 4)
+    stride = MAX_CHUNK_CHARS - overlap
+    chunks = []
+    for start in range(0, len(text), stride):
+        piece = text[start:start + MAX_CHUNK_CHARS].strip()
+        if piece:
+            chunks.append(piece)
+        if start + MAX_CHUNK_CHARS >= len(text):
+            break
+    return chunks
+
+
+def _company_mentions(question: str) -> list[str]:
+    raw_words = re.findall(
+        r"[a-z0-9]+", unicodedata.normalize("NFKC", question).casefold()
+    )
+    normalized_question = " " + " ".join(raw_words) + " "
+    mentions: list[tuple[int, str, str]] = []
+
+    for key, display in _COMPANY_REGISTRY.items():
+        words = re.findall(r"[a-z0-9]+", key)
+        if not words:
+            continue
+        pattern = (
+            r"(?<![a-z0-9])" + r"\s+".join(map(re.escape, words)) + r"(?![a-z0-9])"
+        )
+        for match in re.finditer(pattern, normalized_question):
+            mentions.append((match.start(), key, display))
+
+    broker_spans = []
+    broker_pattern = re.compile(
+        rf"\b(?:does|did|do)\s+(?P<name>.+?)\s+{_BROKER_ACTIONS}\b",
+        re.IGNORECASE,
+    )
+    for match in broker_pattern.finditer(question):
+        broker_spans.append((match.start("name"), match.end("name")))
+
+    proper_name = re.compile(
+        r"\b[A-Z][A-Za-z0-9&.-]*(?:\s+(?:[A-Z][A-Za-z0-9&.-]*|and|of|the)){1,4}\b"
+    )
+    generic = _NON_ENTITY_FIRST_WORDS | _QUERY_STOP_WORDS
+    for match in proper_name.finditer(question):
+        candidate = match.group().strip(" .,-")
+        first = re.findall(r"[A-Za-z]+", candidate)
+        if not first or first[0].casefold() in generic:
+            continue
+        if re.search(
+            r"\b(?:fy|q)\s*\d{1,4}\b|\b(?:19|20)\d{2}\b",
+            candidate,
+            re.IGNORECASE,
+        ):
+            continue
+        if any(match.start() < end and match.end() > start for start, end in broker_spans):
+            continue
+        key = company_key(candidate)
+        if not key or key in _COMPANY_REGISTRY:
+            continue
+        mentions.append((match.start(), key, candidate))
+
+    mentions.sort(key=lambda item: item[0])
+    companies = []
+    seen = set()
+    for _, key, display in mentions:
+        if key not in seen:
+            seen.add(key)
+            companies.append(display)
+    return companies
+
+
+def _query_profile(question: str, companies: list[str]) -> tuple[list[str], list[set[str]]]:
+    company_words = set()
+    for company in companies:
+        company_words.update(_tokens(company))
+
+    core = []
+    for token in _tokens(question):
+        if token.isdigit() or token in _QUERY_STOP_WORDS or token in company_words:
+            continue
+        if re.fullmatch(r"(?:19|20)\d{2}", token):
+            continue
+        if token not in core:
+            core.append(token)
+
+    groups = [_aliases(token) for token in core]
+    expanded = []
+    for token in core:
+        for variant in _aliases(token):
+            if variant not in expanded:
+                expanded.append(variant)
+    return expanded, groups
 
 
 def table_to_text(table_html: str) -> str:
@@ -42,8 +285,52 @@ def table_to_text(table_html: str) -> str:
     every cell unchanged, and include the caption (it holds the unit) in the output. Do not call the
     LLM here.
     """
-    ### YOUR CODE HERE
-    return ""
+    soup = BeautifulSoup(table_html, "lxml")
+    table = soup.find("table") or soup
+    caption = _plain_text(table.find("caption"))
+    lines = [caption] if caption else []
+
+    rows = table.find_all("tr")
+    thead = table.find("thead")
+    header_rows = thead.find_all("tr") if thead else []
+    if not header_rows and rows:
+        first_cells = rows[0].find_all(["th", "td"], recursive=False)
+        if first_cells and all(cell.name == "th" for cell in first_cells):
+            header_rows = [rows[0]]
+
+    headers: dict[int, list[str]] = {}
+    header_ids = {id(row) for row in header_rows}
+    for row in header_rows:
+        for column, cell in enumerate(row.find_all(["th", "td"], recursive=False)):
+            value = _plain_text(cell)
+            if column and value:
+                headers.setdefault(column, []).append(value)
+
+    for row in rows:
+        if id(row) in header_ids or "section" in (row.get("class") or []):
+            continue
+        cells = row.find_all(["th", "td"], recursive=False)
+        if len(cells) < 2:
+            continue
+        row_label = _plain_text(cells[0])
+        if not row_label:
+            continue
+        rendered = []
+        for column, cell in enumerate(cells[1:], start=1):
+            value = _plain_text(cell)
+            if not value:
+                continue
+            column_header = " / ".join(headers.get(column, [])) or f"Column {column}"
+            rendered.append(f"{column_header}: {value}")
+        if not rendered:
+            continue
+        row_line = f"{row_label} | " + " | ".join(rendered)
+        if len(row_line) <= MAX_LINE_CHARS:
+            lines.append(row_line)
+        else:
+            for item in rendered:
+                lines.append(f"{row_label} | {item}"[:MAX_LINE_CHARS])
+    return "\n".join(lines)
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
@@ -52,8 +339,39 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     Every chunk needs the metadata "source" (= file_name), "company", "fiscal_year" (an int) and
     "doc_type" (one of DOC_TYPES). Do not call the LLM here.
     """
-    ### YOUR CODE HERE
-    return []
+    company, fiscal_year, doc_type, soup = _document_metadata(html)
+    key = company_key(company)
+    if key:
+        _COMPANY_REGISTRY.setdefault(key, company)
+
+    blocks = []
+    content_root = soup.body or soup
+    for element in content_root.find_all(["h1", "h2", "h3", "p", "li", "table"]):
+        if element.find_parent(["nav", "footer"]) is not None:
+            continue
+        if element.name != "table" and element.find_parent("table") is not None:
+            continue
+        if element.name == "p" and element.find_parent("li") is not None:
+            continue
+        text = table_to_text(str(element)) if element.name == "table" else _plain_text(element)
+        if text:
+            blocks.append(text)
+
+    if not blocks:
+        fallback = _plain_text(content_root)
+        if fallback:
+            blocks.append(fallback)
+    document_text = "\n\n".join(blocks)
+    metadata = {
+        "source": file_name,
+        "company": company,
+        "fiscal_year": fiscal_year,
+        "doc_type": doc_type,
+    }
+    return [
+        Document(page_content=piece, metadata=dict(metadata))
+        for piece in _chunk_windows(document_text)
+    ]
 
 
 def parse_query(question: str) -> dict:
@@ -61,8 +379,22 @@ def parse_query(question: str) -> dict:
 
     The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
     """
-    ### YOUR CODE HERE
-    return {}
+    companies = _company_mentions(question)
+    year_match = re.search(r"\b(?:fy\s*)?((?:19|20)\d{2})\b", question, re.IGNORECASE)
+    fiscal_year = int(year_match.group(1)) if year_match else None
+
+    text = question.casefold()
+    if re.search(r"\bearnings?\s+(?:conference\s+)?call\b|\bconference\s+call\b", text):
+        doc_type = "earnings_call"
+    elif re.search(
+        r"\b(?:target price|price target|rating|forecast|forecasting|estimate|"
+        r"results review|research report|broker)\b",
+        text,
+    ):
+        doc_type = "research_report"
+    else:
+        doc_type = "annual_report"
+    return {"companies": companies, "fiscal_year": fiscal_year, "doc_type": doc_type}
 
 
 def build_index(chunks: list[Document]) -> Any:
@@ -70,8 +402,45 @@ def build_index(chunks: list[Document]) -> Any:
 
     Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
     """
-    ### YOUR CODE HERE
-    return None
+    documents = list(chunks or [])
+    tokenized = []
+    sources: dict[str, dict[str, Any]] = {}
+    for index, chunk in enumerate(documents):
+        meta = chunk.metadata or {}
+        text = " ".join([
+            chunk.page_content,
+            str(meta.get("company", "")),
+            str(meta.get("fiscal_year", "")),
+            str(meta.get("doc_type", "")),
+        ])
+        tokenized.append(_tokens(text))
+        source = str(meta.get("source", ""))
+        info = sources.setdefault(source, {
+            "company": str(meta.get("company", "")),
+            "company_key": company_key(meta.get("company", "")),
+            "fiscal_year": as_year(meta.get("fiscal_year")),
+            "doc_type": meta.get("doc_type"),
+            "indices": [],
+            "text_parts": [],
+        })
+        info["indices"].append(index)
+        info["text_parts"].append(chunk.page_content)
+
+    for info in sources.values():
+        info["text"] = "\n".join(info.pop("text_parts"))
+        info["tokens"] = _tokens(info["text"])
+        info["token_set"] = set(info["tokens"])
+
+    bm25 = BM25Okapi(tokenized) if tokenized and any(tokenized) else None
+    return {
+        "chunks": documents,
+        "tokenized": tokenized,
+        "bm25": bm25,
+        "sources": sources,
+        "company_keys": {
+            info["company_key"] for info in sources.values() if info["company_key"]
+        },
+    }
 
 
 def retrieve(index: Any, question: str) -> list[Document]:
@@ -79,8 +448,129 @@ def retrieve(index: Any, question: str) -> list[Document]:
 
     Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
     """
-    ### YOUR CODE HERE
-    return []
+    if not isinstance(index, dict) or not index.get("chunks") or not index.get("sources"):
+        return []
+    parsed = parse_query(question)
+    companies = parsed.get("companies") or []
+    company_keys = []
+    for company in companies:
+        key = company_key(company)
+        if key and key not in company_keys:
+            company_keys.append(key)
+    if not company_keys or any(key not in index["company_keys"] for key in company_keys):
+        return []
+
+    query_terms, core_groups = _query_profile(question, companies)
+    if not query_terms:
+        return []
+    bm25 = index.get("bm25")
+    scores = bm25.get_scores(query_terms) if bm25 else [0.0] * len(index["chunks"])
+
+    selected_sources: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    year = as_year(parsed.get("fiscal_year"))
+    doc_type = parsed.get("doc_type")
+    for key in company_keys:
+        company_sources = [
+            (source, info) for source, info in index["sources"].items()
+            if info["company_key"] == key and info["doc_type"] == doc_type
+        ]
+        if year is None:
+            if company_sources:
+                latest = max((info["fiscal_year"] or 0) for _, info in company_sources)
+                company_sources = [
+                    (source, info) for source, info in company_sources
+                    if (info["fiscal_year"] or 0) == latest
+                ]
+        elif doc_type == "annual_report":
+            exact = [
+                (source, info) for source, info in company_sources
+                if info["fiscal_year"] == year
+            ]
+            company_sources = exact or [
+                (source, info) for source, info in company_sources
+                if info["fiscal_year"] == year + 1
+            ]
+        elif doc_type == "earnings_call":
+            company_sources = [
+                (source, info) for source, info in company_sources
+                if info["fiscal_year"] in {year, year - 1}
+            ]
+        else:
+            year_text = re.compile(rf"(?<!\d){year}[a-z]?(?!\d)", re.IGNORECASE)
+            company_sources = [
+                (source, info) for source, info in company_sources
+                if year_text.search(info["text"])
+            ]
+        if not company_sources:
+            return []
+        selected_sources[key] = company_sources
+
+    # Require the requested concepts to appear in the selected company's documents.
+    for key in company_keys:
+        source_infos = selected_sources[key]
+        available_tokens = set().union(*(info["token_set"] for _, info in source_infos))
+        if core_groups:
+            coverage = sum(bool(group & available_tokens) for group in core_groups) / len(core_groups)
+            if coverage < 0.65:
+                return []
+            if len(core_groups) >= 3 and coverage < 1.0:
+                has_near_pair = False
+                for _, info in source_infos:
+                    token_positions: dict[str, list[int]] = {}
+                    for position, token in enumerate(info["tokens"]):
+                        token_positions.setdefault(token, []).append(position)
+                    for left, right in zip(core_groups, core_groups[1:]):
+                        left_positions = [
+                            position for token in left
+                            for position in token_positions.get(token, [])
+                        ]
+                        right_positions = [
+                            position for token in right
+                            for position in token_positions.get(token, [])
+                        ]
+                        if any(abs(a - b) <= 5 for a in left_positions for b in right_positions):
+                            has_near_pair = True
+                            break
+                    if has_near_pair:
+                        break
+                if not has_near_pair:
+                    return []
+
+    ranked_by_company: dict[str, list[int]] = {}
+    for key in company_keys:
+        candidate_indices = [
+            idx for _, info in selected_sources[key] for idx in info["indices"]
+        ]
+        candidate_indices.sort(key=lambda idx: scores[idx], reverse=True)
+        candidate_indices = [idx for idx in candidate_indices if scores[idx] > 0]
+        if not candidate_indices:
+            return []
+        ranked_by_company[key] = candidate_indices
+
+    # Interleave companies so comparisons give the generator evidence for each side.
+    results = []
+    seen = set()
+    depth = 0
+    while len(results) < MAX_RETRIEVED:
+        added = False
+        for key in company_keys:
+            candidates = ranked_by_company.get(key, [])
+            if depth < len(candidates):
+                idx = candidates[depth]
+                signature = (
+                    index["chunks"][idx].metadata.get("source"),
+                    index["chunks"][idx].page_content,
+                )
+                if signature not in seen:
+                    seen.add(signature)
+                    results.append(index["chunks"][idx])
+                    added = True
+                    if len(results) >= MAX_RETRIEVED:
+                        break
+        if not added:
+            break
+        depth += 1
+    return results
 
 
 # =============================================================================
