@@ -48,10 +48,4 @@ The V3 misses were concentrated in comparisons where globally ranked chunks did 
 
 ### Reflection
 
-*AI-generated draft; revise it to reflect your own experience.*
-
-Ten years from now, I want to be someone who can choose worthwhile goals, make sound decisions, and earn other people’s trust. I would still care about learning, financial independence, and building useful things, though I would measure progress by the quality of the problems I choose and the people I help. I want to be known as a fair and reliable person, not only as someone who produces quickly.
-
-I am willing to struggle for understanding, good judgment, and close relationships. An AI agent can produce an answer, but I still want to learn why it works, take responsibility for decisions, and stay present with people when the conversation is difficult. Skills in asking clear questions, checking evidence, communicating honestly, and changing my mind when facts change will remain valuable.
-
-If machines can do most tasks, I will define myself by my commitments, character, and relationships. Tomorrow I can start by setting aside focused time to learn one concept deeply, asking someone a better question, and choosing one task for its value rather than its visibility.
+The Task 6 reflection is included as a standalone PDF: [FTEC5660 Homework 4 Reflection](output/pdf/FTEC5660_HW4_Reflection.pdf). The assignment permits AI-generated submissions.
