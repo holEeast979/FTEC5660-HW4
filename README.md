@@ -48,4 +48,4 @@ The V3 misses were concentrated in comparisons where globally ranked chunks did 
 
 ### Reflection
 
-The Task 6 reflection is included as a standalone PDF: [FTEC5660 Homework 4 Reflection](output/pdf/FTEC5660_HW4_Reflection.pdf). The assignment permits AI-generated submissions.
+The Task 6 reflection is included as a standalone PDF: [FTEC5660 Homework 4 Reflection](FTEC5660_HW4_Reflection.pdf). The assignment permits AI-generated submissions.
